@@ -6,17 +6,18 @@ import requests
 from pathlib import Path
 from dotenv import load_dotenv, set_key
 
-load_dotenv()
-
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+
 ASSETS_DIR = os.path.join(CURRENT_DIR, "assets")
 JSON_FILE = os.path.join(ASSETS_DIR, "todo.json")
 TXT_FILE = os.path.join(ASSETS_DIR, "todo.txt")
 
 Path(ASSETS_DIR).mkdir(parents=True, exist_ok=True)
-
+ENV_PATH = os.path.join(CURRENT_DIR, ".env")
+load_dotenv(dotenv_path=ENV_PATH,override=True)
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 DISCORD_MESSAGE_ID = os.getenv('DISCORD_MESSAGE_ID')  # Tasks Message ID
+
 DISCORD_DONE_MESSAGE_ID = os.getenv('DISCORD_DONE_MESSAGE_ID')  # Done Message ID
 
 
@@ -238,6 +239,7 @@ def sync_discord(tasks_content, done_content):
     if tasks_response.status_code == 200:
         print("Successfully synced tasks TODO list to Discord.")
     else:
+        
         print(f"Failed to sync tasks message to Discord. Status Code: {tasks_response.status_code}")
         print(f"Response: {tasks_response.text}")
         sys.exit(1)
@@ -259,47 +261,109 @@ def sync_discord(tasks_content, done_content):
 
 
 def create_done_message(data):
-    global DISCORD_MESSAGE_ID, DISCORD_DONE_MESSAGE_ID
+    global DISCORD_WEBHOOK_URL, DISCORD_MESSAGE_ID, DISCORD_DONE_MESSAGE_ID
 
-    # Prepare done tasks content
+    # Step 1: Prepare and send new tasks message
+    tasks_content = "TODO LIST - PENDING:\n\n"
+    tasks_content += "ID  | Name                                          | Code Pointer          | Status\n"
+    tasks_content += "-----------------------------------------------------------------------------------------\n"
+    pending_tasks = []
+    for task in data.get("tasks", []):
+        if task['status'] == "":
+            task_id = task.get('id', '')
+            name = task.get('name', '')[:45]
+            code_pointer = task.get('code_pointer', '')[:21]
+            status = task.get('status', '')
+            tasks_content += f"{task_id:<3} | {name:<45} | {code_pointer:<21} | {status}\n"
+            pending_tasks.append(task)
+    tasks_content += "\n"
+
+    tasks_payload = {
+        "content": f"```yaml\n{tasks_content}```",
+    }
+
+    tasks_response = requests.post(f"{DISCORD_WEBHOOK_URL}?wait=true", json=tasks_payload)
+    if tasks_response.status_code == 200:
+        tasks_message = tasks_response.json()
+        new_tasks_message_id = tasks_message['id']
+        print("Successfully created a new tasks TODO list message on Discord.")
+    else:
+        print(f"Failed to create tasks message on Discord. Status Code: {tasks_response.status_code}")
+        sys.exit(1)
+
+    # Step 2: Prepare and send new done message (empty or template)
     done_content = "TODO LIST - DONE:\n\n"
     done_content += "ID  | Name                                          | Code Pointer          | Status\n"
-    done_content += "-----------------------------------------------------------------------------------------\n"
+    done_content += "-----------------------------------------------------------------------------------------\n\n"
+
+    done_payload = {
+        "content": f"```yaml\n{done_content}```",
+    }
+
+    done_response = requests.post(f"{DISCORD_WEBHOOK_URL}?wait=true", json=done_payload)
+    if done_response.status_code == 200:
+        done_message = done_response.json()
+        new_done_message_id = done_message['id']
+        print("Successfully created a new done TODO list message on Discord.")
+    else:
+        print(f"Failed to create done message on Discord. Status Code: {done_response.status_code}")
+        sys.exit(1)
+
+    # Step 3: Edit the old tasks message to become the archived done message
+    archived_done_content = "TODO LIST - DONE (Archived):\n\n"
+    archived_done_content += "ID  | Name                                          | Code Pointer          | Status\n"
+    archived_done_content += "-----------------------------------------------------------------------------------------\n"
     for task in data.get("tasks", []):
         if task['status'] == "✅DONE✅":
             task_id = task.get('id', '')
             name = task.get('name', '')[:45]
             code_pointer = task.get('code_pointer', '')[:21]
             status = task.get('status', '')
-            done_content += f"{task_id:<3} | {name:<45} | {code_pointer:<21} | {status}\n"
-    done_content += "\n"
+            archived_done_content += f"{task_id:<3} | {name:<45} | {code_pointer:<21} | {status}\n"
+    archived_done_content += "\n"
 
-    # Send new done message
-    done_payload = {
-        "content": f"```yaml\n{done_content}```",
-    }
-
-    response = requests.post(DISCORD_WEBHOOK_URL, json=done_payload)
-    if response.status_code == 204:
-        print("Successfully created a new done TODO list message on Discord.")
-    else:
-        print(f"Failed to create done message on Discord. Status Code: {response.status_code}")
+    # Edit the old tasks message (now becomes an archived done message)
+    try:
+        parts = DISCORD_WEBHOOK_URL.split('/')
+        webhook_id = parts[-2]
+        webhook_token = parts[-1]
+    except IndexError:
+        print("Error: Invalid Discord webhook URL format.")
         sys.exit(1)
 
-    # Prompt user to input the new done message ID
-    new_done_message_id = input("Enter the Discord message ID for the new done TODO list message: ")
+    archived_done_edit_url = f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}/messages/{DISCORD_MESSAGE_ID}"
+    archived_done_payload = {
+        "content": f"```yaml\n{archived_done_content}```",
+    }
 
-    # Swap the message IDs
-    old_tasks_message_id = DISCORD_MESSAGE_ID
-    old_done_message_id = DISCORD_DONE_MESSAGE_ID
+    archived_done_response = requests.patch(archived_done_edit_url, json=archived_done_payload)
+    if archived_done_response.status_code == 200:
+        print("Successfully updated the old tasks message to be the archived done TODO list on Discord.")
+    else:
+        print(f"Failed to update tasks message to archived done message on Discord. Status Code: {archived_done_response.status_code}")
+        print(f"Response: {archived_done_response.text}")
+        sys.exit(1)
 
-    DISCORD_MESSAGE_ID = new_done_message_id
-    DISCORD_DONE_MESSAGE_ID = old_tasks_message_id
+    # Step 4: Remove done tasks from data
+    data["tasks"] = pending_tasks  # Only keep pending tasks
 
-    # Update .env file
+    # Step 5: Update the .env file with new message IDs
+    DISCORD_MESSAGE_ID = new_tasks_message_id  # New tasks message ID
+    DISCORD_DONE_MESSAGE_ID = new_done_message_id  # New done message ID
+
     set_key(Path('.env'), 'DISCORD_MESSAGE_ID', DISCORD_MESSAGE_ID)
     set_key(Path('.env'), 'DISCORD_DONE_MESSAGE_ID', DISCORD_DONE_MESSAGE_ID)
-    print("Swapped tasks message ID with done message ID and updated .env accordingly.")
+    print("Updated tasks and done message IDs in .env.")
+
+    # Step 6: Write the updated data back to the JSON file
+    write_json(JSON_FILE, data)
+
+    # Step 7: Write the new TXT file
+    contents = write_txt(data)
+
+    # Optionally, sync the new tasks and done messages
+    # If you have sync functions, you can call them here
+    # sync_discord_with_contents(contents)
 
 
 def setup_discord(webhook_link):
@@ -324,41 +388,38 @@ def setup_discord(webhook_link):
         tasks_content = content
         done_content = "No done tasks available."
 
-    # Send Tasks Message
+    # Send Tasks Message with wait=true to get message ID
     tasks_payload = {
         "content": f"```yaml\n{tasks_content}```",
     }
 
-    tasks_response = requests.post(DISCORD_WEBHOOK_URL, json=tasks_payload)
-    if tasks_response.status_code == 204:
+    tasks_response = requests.post(f"{DISCORD_WEBHOOK_URL}?wait=true", json=tasks_payload)
+    if tasks_response.status_code == 200:
+        tasks_message = tasks_response.json()
+        DISCORD_MESSAGE_ID = tasks_message['id']
         print("Successfully sent tasks TODO list to Discord.")
     else:
         print(f"Failed to send tasks message to Discord. Status Code: {tasks_response.status_code}")
         sys.exit(1)
 
-    # Since Discord webhook response does not provide message ID, prompt user
-    tasks_message_id = input("Enter the Discord message ID for tasks where the TODO list was sent: ")
-    DISCORD_MESSAGE_ID = tasks_message_id
-
-    # Send Done Message
+    # Send Done Message with wait=true to get message ID
     done_payload = {
         "content": f"```yaml\n{done_content}```",
     }
 
-    done_response = requests.post(DISCORD_WEBHOOK_URL, json=done_payload)
-    if done_response.status_code == 204:
+    done_response = requests.post(f"{DISCORD_WEBHOOK_URL}?wait=true", json=done_payload)
+    if done_response.status_code == 200:
+        done_message = done_response.json()
+        DISCORD_DONE_MESSAGE_ID = done_message['id']
         print("Successfully sent done TODO list to Discord.")
     else:
         print(f"Failed to send done message to Discord. Status Code: {done_response.status_code}")
         sys.exit(1)
 
-    done_message_id = input("Enter the Discord message ID for done tasks where the TODO list was sent: ")
-    DISCORD_DONE_MESSAGE_ID = done_message_id
-
     # Save to .env file
-    set_key(Path('.env'), 'DISCORD_WEBHOOK_URL', DISCORD_WEBHOOK_URL)
-    set_key(Path('.env'), 'DISCORD_MESSAGE_ID', DISCORD_MESSAGE_ID)
-    set_key(Path('.env'), 'DISCORD_DONE_MESSAGE_ID', DISCORD_DONE_MESSAGE_ID)
+    set_key('.env', 'DISCORD_WEBHOOK_URL', DISCORD_WEBHOOK_URL)
+    set_key('.env', 'DISCORD_MESSAGE_ID', DISCORD_DONE_MESSAGE_ID)
+    set_key('.env', 'DISCORD_DONE_MESSAGE_ID', DISCORD_MESSAGE_ID)
     print("Discord webhook URL, tasks message ID, and done message ID have been saved to .env.")
 
 
